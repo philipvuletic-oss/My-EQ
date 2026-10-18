@@ -5,6 +5,8 @@ use std::sync::Arc;
 mod analyzer;
 mod eq;
 mod gui;
+mod history;
+mod levels;
 
 use eq::{
     BandSettings, FilterKind, ParametricEq, Placement, Slope, MAX_FREQ, MAX_GAIN_DB, MAX_Q,
@@ -17,6 +19,8 @@ pub struct MyEq {
     sample_rate: Arc<AtomicF32>,
     tap: Arc<analyzer::SpectrumTap>,
     meters: Arc<eq::DynMeters>,
+    levels: Arc<levels::Levels>,
+    auto_gain: levels::AutoGain,
 }
 
 #[derive(Params)]
@@ -132,18 +136,18 @@ impl BandParams {
         }
     }
 
-    fn settings(&self) -> BandSettings {
+    fn settings(&self, gain_scale: f64) -> BandSettings {
         BandSettings {
             enabled: self.enabled.value(),
             kind: self.kind.value(),
             freq: self.freq.value() as f64,
-            gain_db: self.gain.value() as f64,
+            gain_db: (self.gain.value() as f64 * gain_scale).clamp(-MAX_GAIN_DB, MAX_GAIN_DB),
             q: self.q.value() as f64,
             slope: self.slope.value(),
             placement: self.placement.value(),
             dynamic: self.dynamic.value(),
             threshold_db: self.dyn_threshold.value() as f64,
-            range_db: self.dyn_range.value() as f64,
+            range_db: (self.dyn_range.value() as f64 * gain_scale).clamp(-MAX_GAIN_DB, MAX_GAIN_DB),
             attack_ms: self.dyn_attack.value() as f64,
             release_ms: self.dyn_release.value() as f64,
             sidechain: self.dyn_sidechain.value(),
@@ -164,6 +168,14 @@ pub(crate) struct MyEqParams {
 
     #[id = "out_pan"]
     output_pan: FloatParam,
+
+    /// Scales every band's gain (and dynamic range); 100% leaves them untouched.
+    #[id = "gain_scale"]
+    gain_scale: FloatParam,
+
+    /// Matches output loudness to input loudness.
+    #[id = "auto_gain"]
+    auto_gain: BoolParam,
 }
 
 impl MyEqParams {
@@ -171,17 +183,21 @@ impl MyEqParams {
     /// `eq::magnitude_response`.
     #[allow(dead_code)]
     pub(crate) fn band_settings(&self) -> [BandSettings; NUM_BANDS] {
-        std::array::from_fn(|i| self.bands[i].settings())
+        let scale = self.gain_scale.value() as f64;
+        std::array::from_fn(|i| self.bands[i].settings(scale))
     }
 }
 
 impl Default for MyEq {
     fn default() -> Self {
         let meters = eq::DynMeters::new();
+        let levels = levels::Levels::new();
         Self {
             params: Arc::new(MyEqParams::default()),
             eq: ParametricEq::with_meters(meters.clone()),
             meters,
+            levels,
+            auto_gain: levels::AutoGain::new(),
             sample_rate: Arc::new(AtomicF32::new(44100.0)),
             tap: analyzer::SpectrumTap::new(),
         }
@@ -193,6 +209,15 @@ impl Default for MyEqParams {
         Self {
             editor_state: EguiState::from_size(1000, 560),
             bands: std::array::from_fn(BandParams::new),
+            gain_scale: FloatParam::new(
+                "Gain Scale",
+                1.0,
+                FloatRange::Linear { min: -1.0, max: 2.0 },
+            )
+            .with_step_size(0.01)
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+            auto_gain: BoolParam::new("Auto Gain", false),
             output_gain: FloatParam::new(
                 "Output Gain",
                 util::db_to_gain(0.0),
@@ -251,9 +276,10 @@ impl Plugin for MyEq {
         let sample_rate = self.sample_rate.clone();
         let tap = self.tap.clone();
         let meters = self.meters.clone();
+        let levels = self.levels.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            gui::GuiState::new(tap, meters),
+            gui::GuiState::new(tap, meters, levels, &params),
             |_, _| {},
             move |egui_ctx, setter, state| {
                 gui::draw(
@@ -276,11 +302,13 @@ impl Plugin for MyEq {
     ) -> bool {
         self.sample_rate.store(buffer_config.sample_rate, std::sync::atomic::Ordering::Relaxed);
         self.eq.set_sample_rate(buffer_config.sample_rate as f64);
+        self.auto_gain.set_sample_rate(buffer_config.sample_rate as f64);
         true
     }
 
     fn reset(&mut self) {
         self.eq.reset();
+        self.auto_gain.reset();
     }
 
     fn process(
@@ -296,6 +324,10 @@ impl Plugin for MyEq {
             Some(b) if b.channels() >= 2 => b.as_slice_immutable(),
             _ => &[],
         };
+
+        let auto_on = self.params.auto_gain.value();
+        let (mut peak_l, mut peak_r) = (0.0f32, 0.0f32);
+        let mut ag = 1.0f32;
 
         for (idx, mut channel_samples) in buffer.iter_samples().enumerate() {
             let sc = match sidechain {
@@ -316,12 +348,16 @@ impl Plugin for MyEq {
             let l = *channel_samples.get_mut(0).unwrap();
             let r = *channel_samples.get_mut(1).unwrap();
             self.tap.pre.push((l + r) * 0.5);
-            let (l, r) = self.eq.process_sample(l, r, sc);
-            let (l, r) = (l * gl, r * gr);
+            let (el, er) = self.eq.process_sample(l, r, sc);
+            ag = self.auto_gain.process((l, r), (el, er), auto_on);
+            let (l, r) = (el * ag * gl, er * ag * gr);
+            peak_l = peak_l.max(l.abs());
+            peak_r = peak_r.max(r.abs());
             self.tap.post.push((l + r) * 0.5);
             *channel_samples.get_mut(0).unwrap() = l;
             *channel_samples.get_mut(1).unwrap() = r;
         }
+        self.levels.report(peak_l, peak_r, util::gain_to_db(ag));
         ProcessStatus::Normal
     }
 }

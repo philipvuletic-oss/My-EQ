@@ -5,6 +5,8 @@ use crate::eq::{
     self, BandSettings, FilterKind, Placement, ResponseView, Slope, MAX_FREQ, MAX_GAIN_DB, MAX_Q,
     MIN_FREQ, MIN_Q, NUM_BANDS,
 };
+use crate::history::History;
+use crate::levels::Levels;
 use crate::{BandParams, MyEqParams};
 use nih_plug::prelude::*;
 use nih_plug_egui::egui::{
@@ -17,6 +19,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 const BAR_HEIGHT: f32 = 44.0;
+const MIN_WIDTH: f32 = 900.0;
+const RADIUS: u8 = 8;
+const METER_W: f32 = 16.0;
 const PAD_Y: f32 = 16.0;
 const FREQ_LABELS: [(f64, &str); 10] = [
     (20.0, "20"),
@@ -37,12 +42,27 @@ pub struct GuiState {
     mode: SpectrumMode,
     resolution: Resolution,
     meters: Arc<eq::DynMeters>,
+    levels: Arc<Levels>,
+    history: History,
+    styled: bool,
+    meter_db: [f32; 2],
+    meter_hold: [(f32, f64); 2],
 }
 
 impl GuiState {
-    pub fn new(tap: Arc<SpectrumTap>, meters: Arc<eq::DynMeters>) -> Self {
+    pub fn new(
+        tap: Arc<SpectrumTap>,
+        meters: Arc<eq::DynMeters>,
+        levels: Arc<Levels>,
+        params: &Arc<MyEqParams>,
+    ) -> Self {
         Self {
             meters,
+            levels,
+            history: History::new(params.as_ref()),
+            styled: false,
+            meter_db: [-120.0; 2],
+            meter_hold: [(-120.0, 0.0); 2],
             selected: None,
             analyzer: Analyzer::new(tap),
             mode: SpectrumMode::Both,
@@ -60,7 +80,7 @@ fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-fn set<P: Param>(setter: &ParamSetter, param: &P, value: P::Plain) {
+pub(crate) fn set<P: Param>(setter: &ParamSetter, param: &P, value: P::Plain) {
     setter.begin_set_parameter(param);
     setter.set_parameter(param, value);
     setter.end_set_parameter(param);
@@ -110,8 +130,13 @@ pub fn draw(
     egui_state: &EguiState,
     sample_rate: f64,
 ) {
+    if !state.styled {
+        apply_style(ctx);
+        state.styled = true;
+    }
+    handle_history(ctx, setter, state);
     ResizableWindow::new("my_eq_resize")
-        .min_size(vec2(640.0, 420.0))
+        .min_size(vec2(MIN_WIDTH, 420.0))
         .show(ctx, egui_state, |ui| {
             let full = ui.max_rect();
             let plot = Plot {
@@ -141,7 +166,9 @@ pub fn draw(
                 }
             }
 
+            draw_meter(ui, state, plot);
             draw_bottom_bar(ui, setter, state, params, full);
+            draw_toolbar(ctx, setter, state, params);
             if let Some(sel) = state.selected {
                 draw_band_panel(ctx, setter, state, params, sel, full);
             }
@@ -202,7 +229,7 @@ fn draw_background(ui: &Ui, full: Rect, plot: Plot) {
         );
         let text = if db > 0 { format!("+{db}") } else { format!("{db}") };
         painter.text(
-            pos2(plot.rect.right() - 6.0, y - 2.0),
+            pos2(plot.rect.right() - METER_W - 10.0, y - 2.0),
             Align2::RIGHT_BOTTOM,
             text,
             font.clone(),
@@ -401,8 +428,10 @@ fn node(
                 (plot.freq_at(pos.x), plot.db_at(pos.y))
             };
             set(setter, &bp.freq, nf.clamp(MIN_FREQ, MAX_FREQ) as f32);
-            if uses_gain(b.kind) {
-                set(setter, &bp.gain, ng as f32);
+            // Band gains are shown after the global gain scale; undo it for the raw param.
+            let scale = params.gain_scale.value() as f64;
+            if uses_gain(b.kind) && scale.abs() >= 0.05 {
+                set(setter, &bp.gain, (ng / scale).clamp(-MAX_GAIN_DB, MAX_GAIN_DB) as f32);
             }
         }
     }
@@ -418,6 +447,9 @@ fn node(
         }
     }
     resp.context_menu(|ui| node_menu(ui, setter, state, params, i));
+    if resp.dragged() {
+        drag_tooltip(ui, center, &b, plot);
+    }
 
     let color = band_color(i);
     let painter = ui.painter();
@@ -441,6 +473,34 @@ fn node(
     if selected {
         painter.circle_stroke(center, r + 2.0, Stroke::new(1.5, Color32::WHITE));
     }
+}
+
+fn format_freq(f: f64) -> String {
+    if f >= 1000.0 {
+        format!("{:.2} kHz", f / 1000.0)
+    } else {
+        format!("{:.1} Hz", f)
+    }
+}
+
+/// Small rounded readout that follows the node while it is being dragged.
+fn drag_tooltip(ui: &Ui, center: Pos2, b: &BandSettings, plot: Plot) {
+    let text = if uses_gain(b.kind) {
+        format!("{}   {:+.1} dB", format_freq(b.freq), b.gain_db)
+    } else {
+        format_freq(b.freq)
+    };
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("drag_tip")));
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), Color32::WHITE);
+    let size = galley.size() + vec2(16.0, 10.0);
+    let mut min = center + vec2(14.0, -size.y - 12.0);
+    min.x = min.x.min(plot.rect.right() - size.x - METER_W - 4.0).max(plot.rect.left() + 4.0);
+    min.y = min.y.max(plot.rect.top() + 4.0);
+    let rect = Rect::from_min_size(min, size);
+    painter.add(egui::Shadow { offset: [0, 2], blur: 8, spread: 0, color: Color32::from_black_alpha(90) }.as_shape(rect, RADIUS));
+    painter.rect_filled(rect, RADIUS, Color32::from_rgba_unmultiplied(30, 33, 41, 240));
+    painter.rect_stroke(rect, RADIUS, Stroke::new(1.0, Color32::from_white_alpha(30)), egui::StrokeKind::Inside);
+    painter.galley(rect.min + vec2(8.0, 5.0), galley, Color32::WHITE);
 }
 
 fn enum_menu<T: Enum + PartialEq + Copy + 'static>(
@@ -705,6 +765,23 @@ fn draw_bottom_bar(ui: &mut Ui, setter: &ParamSetter, state: &mut GuiState, para
     knob(&mut bar_ui, setter, &params.output_pan, 30.0, accent);
     bar_ui.label(egui::RichText::new(value_text(&params.output_pan)).size(11.0));
 
+    bar_ui.add_space(16.0);
+    bar_ui.label(egui::RichText::new("GAIN SCALE").size(11.0).color(dim));
+    knob(&mut bar_ui, setter, &params.gain_scale, 30.0, accent);
+    bar_ui.label(egui::RichText::new(value_text(&params.gain_scale)).size(11.0));
+    bar_ui.add_space(16.0);
+    let auto = params.auto_gain.value();
+    if bar_ui
+        .selectable_label(auto, "Auto Gain")
+        .on_hover_text("Match output loudness to input loudness")
+        .clicked()
+    {
+        set(setter, &params.auto_gain, !auto);
+    }
+    if auto {
+        bar_ui.label(egui::RichText::new(format!("{:+.1} dB", state.levels.auto_gain_db())).size(11.0));
+    }
+
     // Right-aligned analyzer controls.
     bar_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         for (r, name) in [(Resolution::High, "High"), (Resolution::Medium, "Med"), (Resolution::Low, "Low")] {
@@ -730,4 +807,237 @@ fn draw_bottom_bar(ui: &mut Ui, setter: &ParamSetter, state: &mut GuiState, para
 
 pub fn sample_rate_of(sr: &nih_plug::prelude::AtomicF32) -> f64 {
     sr.load(Ordering::Relaxed) as f64
+}
+
+
+// ---------------------------------------------------------------------------
+// Style, undo/redo, A/B, presets, meter
+// ---------------------------------------------------------------------------
+
+fn apply_style(ctx: &Context) {
+    ctx.style_mut(|style| {
+        let v = &mut style.visuals;
+        let r = egui::CornerRadius::same(RADIUS);
+        v.widgets.noninteractive.corner_radius = r;
+        v.widgets.inactive.corner_radius = r;
+        v.widgets.hovered.corner_radius = r;
+        v.widgets.active.corner_radius = r;
+        v.widgets.open.corner_radius = r;
+        v.menu_corner_radius = r;
+        v.window_corner_radius = egui::CornerRadius::same(RADIUS + 4);
+        v.popup_shadow = egui::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(110) };
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(40, 44, 54);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(54, 59, 72);
+        style.animation_time = 0.12;
+    });
+}
+
+fn handle_history(ctx: &Context, setter: &ParamSetter, state: &mut GuiState) {
+    let (now, down) = ctx.input(|i| (i.time, i.pointer.any_down()));
+    state.history.update(now, down);
+    let (undo, redo) = ctx.input_mut(|i| {
+        let redo = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
+            || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y);
+        let undo = i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z);
+        (undo, redo)
+    });
+    if redo {
+        state.history.redo(setter);
+    } else if undo {
+        state.history.undo(setter);
+    }
+}
+
+fn draw_toolbar(ctx: &Context, setter: &ParamSetter, state: &mut GuiState, params: &Arc<MyEqParams>) {
+    let frame = egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(26, 29, 36, 225))
+        .stroke(Stroke::new(1.0, Color32::from_white_alpha(24)))
+        .corner_radius(RADIUS + 2)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: Color32::from_black_alpha(80) });
+    egui::Area::new(Id::new("toolbar"))
+        .order(egui::Order::Foreground)
+        .anchor(Align2::LEFT_TOP, vec2(12.0, 12.0))
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.menu_button("Presets  \u{25be}", |ui| {
+                        for preset in PRESETS {
+                            if ui.button(preset.name).clicked() {
+                                apply_preset(setter, params, preset);
+                                state.selected = None;
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    for (idx, name) in ["A", "B"].into_iter().enumerate() {
+                        let active = state.history.ab_active == idx;
+                        let btn = egui::Button::new(egui::RichText::new(name).strong())
+                            .fill(if active { Color32::from_rgb(70, 95, 150) } else { Color32::from_rgb(40, 44, 54) })
+                            .min_size(vec2(26.0, 22.0));
+                        if ui.add(btn).on_hover_text("A/B comparison").clicked() {
+                            state.history.switch_ab(setter, idx);
+                        }
+                    }
+                    ui.separator();
+                    let undo = ui.add_enabled(state.history.can_undo(), egui::Button::new("\u{21b6}").min_size(vec2(26.0, 22.0)));
+                    if undo.on_hover_text("Undo (Ctrl+Z)").clicked() {
+                        state.history.undo(setter);
+                    }
+                    let redo = ui.add_enabled(state.history.can_redo(), egui::Button::new("\u{21b7}").min_size(vec2(26.0, 22.0)));
+                    if redo.on_hover_text("Redo (Ctrl+Shift+Z)").clicked() {
+                        state.history.redo(setter);
+                    }
+                });
+            });
+        });
+}
+
+struct PresetBand {
+    kind: FilterKind,
+    freq: f32,
+    gain: f32,
+    q: f32,
+    slope: Slope,
+    /// (threshold dB, range dB, attack ms, release ms)
+    dynamic: Option<(f32, f32, f32, f32)>,
+}
+
+const fn pb(kind: FilterKind, freq: f32, gain: f32, q: f32, slope: Slope) -> PresetBand {
+    PresetBand { kind, freq, gain, q, slope, dynamic: None }
+}
+
+struct Preset {
+    name: &'static str,
+    bands: &'static [PresetBand],
+}
+
+const PRESETS: &[Preset] = &[
+    Preset { name: "Init (flat)", bands: &[] },
+    Preset {
+        name: "Vocal clean-up",
+        bands: &[
+            pb(FilterKind::LowCut, 80.0, 0.0, 0.707, Slope::Db18),
+            pb(FilterKind::Bell, 300.0, -3.0, 1.2, Slope::Db12),
+            pb(FilterKind::Bell, 3000.0, 1.5, 0.9, Slope::Db12),
+            PresetBand {
+                kind: FilterKind::Bell,
+                freq: 6500.0,
+                gain: 0.0,
+                q: 3.0,
+                slope: Slope::Db12,
+                dynamic: Some((-35.0, -6.0, 2.0, 80.0)),
+            },
+            pb(FilterKind::HighShelf, 10000.0, 2.0, 0.707, Slope::Db12),
+        ],
+    },
+    Preset {
+        name: "Kick tighten",
+        bands: &[
+            pb(FilterKind::LowCut, 30.0, 0.0, 0.707, Slope::Db24),
+            pb(FilterKind::Bell, 60.0, 3.0, 1.2, Slope::Db12),
+            pb(FilterKind::Bell, 300.0, -4.0, 1.5, Slope::Db12),
+            pb(FilterKind::Bell, 3500.0, 2.5, 1.0, Slope::Db12),
+            pb(FilterKind::HighCut, 14000.0, 0.0, 0.707, Slope::Db12),
+        ],
+    },
+    Preset {
+        name: "Master air",
+        bands: &[
+            pb(FilterKind::LowCut, 25.0, 0.0, 0.707, Slope::Db12),
+            pb(FilterKind::Bell, 250.0, -1.0, 0.6, Slope::Db12),
+            pb(FilterKind::Bell, 3000.0, 0.8, 0.5, Slope::Db12),
+            pb(FilterKind::HighShelf, 12000.0, 2.5, 0.6, Slope::Db12),
+        ],
+    },
+];
+
+fn apply_preset(setter: &ParamSetter, params: &MyEqParams, preset: &Preset) {
+    for (i, bp) in params.bands.iter().enumerate() {
+        match preset.bands.get(i) {
+            Some(b) => {
+                set(setter, &bp.kind, b.kind);
+                set(setter, &bp.freq, b.freq);
+                set(setter, &bp.gain, b.gain);
+                set(setter, &bp.q, b.q);
+                set(setter, &bp.slope, b.slope);
+                set(setter, &bp.placement, Placement::Stereo);
+                set(setter, &bp.dyn_sidechain, false);
+                set(setter, &bp.dynamic, b.dynamic.is_some());
+                if let Some((thr, range, att, rel)) = b.dynamic {
+                    set(setter, &bp.dyn_threshold, thr);
+                    set(setter, &bp.dyn_range, range);
+                    set(setter, &bp.dyn_attack, att);
+                    set(setter, &bp.dyn_release, rel);
+                }
+                set(setter, &bp.enabled, true);
+            }
+            None => {
+                if bp.enabled.value() {
+                    set(setter, &bp.enabled, false);
+                }
+                if bp.dynamic.value() {
+                    set(setter, &bp.dynamic, false);
+                }
+            }
+        }
+    }
+}
+
+const METER_FLOOR_DB: f32 = -60.0;
+
+/// Output level meter on the right edge: smoothed bar plus a short peak hold.
+fn draw_meter(ui: &mut Ui, state: &mut GuiState, plot: Plot) {
+    let (now, dt) = ui.input(|i| (i.time, i.stable_dt.min(0.1)));
+    let peaks = state.levels.take_peaks();
+    for ch in 0..2 {
+        let db = 20.0 * peaks[ch].max(1e-6).log10();
+        state.meter_db[ch] = if db > state.meter_db[ch] { db } else { (state.meter_db[ch] - 40.0 * dt).max(db) };
+        let (hold, t) = state.meter_hold[ch];
+        if db >= hold {
+            state.meter_hold[ch] = (db, now);
+        } else if now - t > 1.2 {
+            state.meter_hold[ch].0 = (hold - 20.0 * dt).max(db);
+        }
+    }
+    ui.ctx().request_repaint();
+
+    let area = Rect::from_min_max(
+        pos2(plot.rect.right() - METER_W - 4.0, plot.rect.top() + PAD_Y),
+        pos2(plot.rect.right() - 4.0, plot.rect.bottom() - PAD_Y),
+    );
+    let painter = ui.painter();
+    let y_of = |db: f32| {
+        let t = ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
+        area.bottom() - t * area.height()
+    };
+    let bar_w = (METER_W - 2.0) / 2.0;
+    for ch in 0..2 {
+        let x0 = area.left() + ch as f32 * (bar_w + 2.0);
+        let bar = Rect::from_min_max(pos2(x0, area.top()), pos2(x0 + bar_w, area.bottom()));
+        painter.rect_filled(bar, 2.0, Color32::from_white_alpha(14));
+        let steps = 48;
+        for k in 0..steps {
+            let db_lo = METER_FLOOR_DB + (-METER_FLOOR_DB) * k as f32 / steps as f32;
+            let db_hi = METER_FLOOR_DB + (-METER_FLOOR_DB) * (k + 1) as f32 / steps as f32;
+            if db_lo >= state.meter_db[ch] {
+                break;
+            }
+            let color = if db_lo > -6.0 {
+                Color32::from_rgb(235, 80, 70)
+            } else if db_lo > -18.0 {
+                Color32::from_rgb(230, 200, 80)
+            } else {
+                Color32::from_rgb(90, 200, 140)
+            };
+            let top = y_of(db_hi.min(state.meter_db[ch]));
+            painter.rect_filled(Rect::from_min_max(pos2(x0, top), pos2(x0 + bar_w, y_of(db_lo))), 0.0, color);
+        }
+        let hy = y_of(state.meter_hold[ch].0);
+        if state.meter_hold[ch].0 > METER_FLOOR_DB {
+            painter.line_segment([pos2(x0, hy), pos2(x0 + bar_w, hy)], Stroke::new(1.5, Color32::from_white_alpha(200)));
+        }
+    }
 }
