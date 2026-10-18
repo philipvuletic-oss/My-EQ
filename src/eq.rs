@@ -118,7 +118,7 @@ pub enum ResponseView {
     Side,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BandSettings {
     pub enabled: bool,
     pub kind: FilterKind,
@@ -353,6 +353,21 @@ fn band_complex_response(s: &BandSettings, sr: f64, freq: f64) -> C {
         h = h.mul(c.response(theta));
     }
     h
+}
+
+/// Linear magnitude of one band's own response (ignoring placement) on a uniform grid from
+/// 0 Hz to Nyquist, `out.len()` points inclusive. Designs the filter once.
+pub fn band_magnitude_grid(s: &BandSettings, sr: f64, out: &mut [f64]) {
+    let d = design(s.kind, s.freq, s.gain_db, s.q, s.slope, sr);
+    let last = (out.len().max(2) - 1) as f64;
+    for (k, o) in out.iter_mut().enumerate() {
+        let theta = (PI * 0.5 * k as f64 / last).min(PI * 0.5 - 1e-6);
+        let mut h = C::ONE;
+        for c in &d.sections[..d.count] {
+            h = h.mul(c.response(theta));
+        }
+        *o = h.norm();
+    }
 }
 
 /// Combined magnitude response (linear gain) of all enabled bands at `freq` Hz

@@ -142,7 +142,17 @@ pub fn draw(
             let plot = Plot {
                 rect: Rect::from_min_max(full.min, pos2(full.right(), full.bottom() - BAR_HEIGHT)),
             };
-            let bands = params.band_settings();
+            let mode = params.mode.value();
+            let mut bands = params.band_settings();
+            if mode == crate::ProcessingMode::LinearPhase {
+                // Dynamics are inactive in Linear Phase mode; show static curves.
+                bands.iter_mut().for_each(|b| b.dynamic = false);
+            }
+            let curve_sr = if mode == crate::ProcessingMode::NaturalPhase {
+                sample_rate * 2.0
+            } else {
+                sample_rate
+            };
 
             draw_background(ui, full, plot);
             state.analyzer.set_resolution(state.resolution);
@@ -155,7 +165,7 @@ pub fn draw(
             if bands.iter().any(|b| b.enabled && b.dynamic) {
                 ui.ctx().request_repaint();
             }
-            draw_curves_and_nodes(ui, setter, state, params, &bands, plot, sample_rate);
+            draw_curves_and_nodes(ui, setter, state, params, &bands, plot, curve_sr);
 
             if bg.clicked() {
                 state.selected = None;
@@ -168,7 +178,7 @@ pub fn draw(
 
             draw_meter(ui, state, plot);
             draw_bottom_bar(ui, setter, state, params, full);
-            draw_toolbar(ctx, setter, state, params);
+            draw_toolbar(ctx, setter, state, params, sample_rate);
             if let Some(sel) = state.selected {
                 draw_band_panel(ctx, setter, state, params, sel, full);
             }
@@ -848,7 +858,7 @@ fn handle_history(ctx: &Context, setter: &ParamSetter, state: &mut GuiState) {
     }
 }
 
-fn draw_toolbar(ctx: &Context, setter: &ParamSetter, state: &mut GuiState, params: &Arc<MyEqParams>) {
+fn draw_toolbar(ctx: &Context, setter: &ParamSetter, state: &mut GuiState, params: &Arc<MyEqParams>, sample_rate: f64) {
     let frame = egui::Frame::NONE
         .fill(Color32::from_rgba_unmultiplied(26, 29, 36, 225))
         .stroke(Stroke::new(1.0, Color32::from_white_alpha(24)))
@@ -882,6 +892,8 @@ fn draw_toolbar(ctx: &Context, setter: &ParamSetter, state: &mut GuiState, param
                         }
                     }
                     ui.separator();
+                    draw_mode_controls(ui, setter, params, sample_rate);
+                    ui.separator();
                     let undo = ui.add_enabled(state.history.can_undo(), egui::Button::new("\u{21b6}").min_size(vec2(26.0, 22.0)));
                     if undo.on_hover_text("Undo (Ctrl+Z)").clicked() {
                         state.history.undo(setter);
@@ -893,6 +905,40 @@ fn draw_toolbar(ctx: &Context, setter: &ParamSetter, state: &mut GuiState, param
                 });
             });
         });
+}
+
+fn draw_mode_controls(ui: &mut egui::Ui, setter: &ParamSetter, params: &Arc<MyEqParams>, sample_rate: f64) {
+    use crate::linear::LinearLatency;
+    use crate::ProcessingMode;
+    let cur = params.mode.value();
+    for (m, name, tip) in [
+        (ProcessingMode::ZeroLatency, "Zero", "Zero latency (minimum phase)"),
+        (ProcessingMode::NaturalPhase, "Natural", "Natural phase: 2x oversampled, analog-like response near Nyquist"),
+        (ProcessingMode::LinearPhase, "Linear", "Linear phase FIR (adds latency; dynamics and sidechain inactive)"),
+    ] {
+        let btn = egui::Button::new(name)
+            .fill(if cur == m { Color32::from_rgb(70, 95, 150) } else { Color32::from_rgb(40, 44, 54) })
+            .min_size(vec2(0.0, 22.0));
+        if ui.add(btn).on_hover_text(tip).clicked() {
+            setter.begin_set_parameter(&params.mode);
+            setter.set_parameter(&params.mode, m);
+            setter.end_set_parameter(&params.mode);
+        }
+    }
+    if cur == ProcessingMode::LinearPhase {
+        let q = params.lin_quality.value();
+        for (v, name) in [(LinearLatency::Low, "Low"), (LinearLatency::Medium, "Med"), (LinearLatency::High, "High")] {
+            let btn = egui::Button::new(name)
+                .fill(if q == v { Color32::from_rgb(70, 95, 150) } else { Color32::from_rgb(40, 44, 54) })
+                .min_size(vec2(0.0, 22.0));
+            let ms = v.latency() as f64 / sample_rate.max(1.0) * 1000.0;
+            if ui.add(btn).on_hover_text(format!("Latency \u{2248} {ms:.0} ms")).clicked() {
+                setter.begin_set_parameter(&params.lin_quality);
+                setter.set_parameter(&params.lin_quality, v);
+                setter.end_set_parameter(&params.lin_quality);
+            }
+        }
+    }
 }
 
 struct PresetBand {

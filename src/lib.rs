@@ -1,5 +1,6 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 
 mod analyzer;
@@ -7,13 +8,41 @@ mod eq;
 mod gui;
 mod history;
 mod levels;
+mod linear;
+mod oversample;
 
 use eq::{
     BandSettings, FilterKind, ParametricEq, Placement, Slope, MAX_FREQ, MAX_GAIN_DB, MAX_Q,
     MIN_FREQ, MIN_Q, NUM_BANDS,
 };
 
+/// Zero Latency runs the SVF cascade directly; Natural Phase runs it at 2x the sample rate
+/// (so the response near Nyquist matches the analog prototype); Linear Phase applies the
+/// magnitude response as a symmetric FIR.
+#[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcessingMode {
+    #[name = "Zero Latency"]
+    ZeroLatency,
+    #[name = "Natural Phase"]
+    NaturalPhase,
+    #[name = "Linear Phase"]
+    LinearPhase,
+}
+
+/// Seconds after which a lost redesign request is retried.
+const TASK_WATCHDOG_SECS: f32 = 3.0;
+
 pub struct MyEq {
+    cur_mode: ProcessingMode,
+    up: oversample::StereoUp,
+    up_sc: oversample::StereoUp,
+    down: oversample::StereoDown,
+    conv: linear::Convolver,
+    lin_shared: Arc<linear::Shared>,
+    last_sent: Option<([BandSettings; NUM_BANDS], linear::LinearLatency, f32)>,
+    task_age: u32,
+    reported_latency: u32,
+    sr: f32,
     params: Arc<MyEqParams>,
     eq: ParametricEq,
     sample_rate: Arc<AtomicF32>,
@@ -176,6 +205,13 @@ pub(crate) struct MyEqParams {
     /// Matches output loudness to input loudness.
     #[id = "auto_gain"]
     auto_gain: BoolParam,
+
+    #[id = "proc_mode"]
+    mode: EnumParam<ProcessingMode>,
+
+    /// Linear Phase FIR length / latency.
+    #[id = "lin_lat"]
+    lin_quality: EnumParam<linear::LinearLatency>,
 }
 
 impl MyEqParams {
@@ -192,7 +228,18 @@ impl Default for MyEq {
     fn default() -> Self {
         let meters = eq::DynMeters::new();
         let levels = levels::Levels::new();
+        let lin_shared = Arc::new(linear::Shared::default());
         Self {
+            cur_mode: ProcessingMode::ZeroLatency,
+            up: oversample::StereoUp::new(),
+            up_sc: oversample::StereoUp::new(),
+            down: oversample::StereoDown::new(),
+            conv: linear::Convolver::new(lin_shared.clone()),
+            lin_shared,
+            last_sent: None,
+            task_age: 0,
+            reported_latency: 0,
+            sr: 44100.0,
             params: Arc::new(MyEqParams::default()),
             eq: ParametricEq::with_meters(meters.clone()),
             meters,
@@ -218,6 +265,8 @@ impl Default for MyEqParams {
             .with_value_to_string(formatters::v2s_f32_percentage(0))
             .with_string_to_value(formatters::s2v_f32_percentage()),
             auto_gain: BoolParam::new("Auto Gain", false),
+            mode: EnumParam::new("Processing Mode", ProcessingMode::ZeroLatency),
+            lin_quality: EnumParam::new("Linear Phase Latency", linear::LinearLatency::Medium),
             output_gain: FloatParam::new(
                 "Output Gain",
                 util::db_to_gain(0.0),
@@ -264,7 +313,15 @@ impl Plugin for MyEq {
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
     type SysExMessage = ();
-    type BackgroundTask = ();
+    type BackgroundTask = linear::LinearTask;
+
+    fn task_executor(&mut self) -> TaskExecutor<Self> {
+        let shared = self.lin_shared.clone();
+        Box::new(move |task| {
+            shared.run_task(&task);
+            shared.pending.store(false, AtomicOrdering::Release);
+        })
+    }
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
@@ -298,8 +355,15 @@ impl Plugin for MyEq {
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
+        context: &mut impl InitContext<Self>,
     ) -> bool {
+        self.sr = buffer_config.sample_rate;
+        self.cur_mode = ProcessingMode::ZeroLatency;
+        self.conv.clear();
+        self.last_sent = None;
+        self.lin_shared.pending.store(false, AtomicOrdering::Release);
+        self.reported_latency = 0;
+        context.set_latency_samples(0);
         self.sample_rate.store(buffer_config.sample_rate, std::sync::atomic::Ordering::Relaxed);
         self.eq.set_sample_rate(buffer_config.sample_rate as f64);
         self.auto_gain.set_sample_rate(buffer_config.sample_rate as f64);
@@ -308,6 +372,10 @@ impl Plugin for MyEq {
 
     fn reset(&mut self) {
         self.eq.reset();
+        self.up.reset();
+        self.up_sc.reset();
+        self.down.reset();
+        self.conv.reset();
         self.auto_gain.reset();
     }
 
@@ -315,10 +383,53 @@ impl Plugin for MyEq {
         &mut self,
         buffer: &mut Buffer,
         aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let settings: [BandSettings; NUM_BANDS] = self.params.band_settings();
-        self.eq.set_bands(&settings);
+        let mode = self.params.mode.value();
+        let quality = self.params.lin_quality.value();
+        if mode != self.cur_mode {
+            self.eq.reset();
+            self.up.reset();
+            self.up_sc.reset();
+            self.down.reset();
+            self.eq.set_sample_rate(
+                self.sr as f64 * if mode == ProcessingMode::NaturalPhase { 2.0 } else { 1.0 },
+            );
+            if mode == ProcessingMode::LinearPhase {
+                self.conv.reset();
+            }
+            self.cur_mode = mode;
+        }
+        let latency = match mode {
+            ProcessingMode::ZeroLatency => 0,
+            ProcessingMode::NaturalPhase => oversample::LATENCY as u32,
+            ProcessingMode::LinearPhase => quality.latency() as u32,
+        };
+        if latency != self.reported_latency {
+            self.reported_latency = latency;
+            context.set_latency_samples(latency);
+        }
+        if mode == ProcessingMode::LinearPhase {
+            let want = (settings, quality, self.sr);
+            if self.lin_shared.pending.load(AtomicOrdering::Acquire) {
+                self.task_age += buffer.samples() as u32;
+                if self.task_age as f32 > TASK_WATCHDOG_SECS * self.sr {
+                    self.lin_shared.pending.store(false, AtomicOrdering::Release);
+                }
+            } else if self.last_sent.as_ref() != Some(&want) {
+                self.lin_shared.pending.store(true, AtomicOrdering::Release);
+                self.task_age = 0;
+                context.execute_background(linear::LinearTask {
+                    bands: settings,
+                    quality,
+                    sr: self.sr,
+                });
+                self.last_sent = Some(want);
+            }
+        } else {
+            self.eq.set_bands(&settings);
+        }
 
         let sidechain: &[&mut [f32]] = match aux.inputs.first_mut() {
             Some(b) if b.channels() >= 2 => b.as_slice_immutable(),
@@ -348,7 +459,17 @@ impl Plugin for MyEq {
             let l = *channel_samples.get_mut(0).unwrap();
             let r = *channel_samples.get_mut(1).unwrap();
             self.tap.pre.push((l + r) * 0.5);
-            let (el, er) = self.eq.process_sample(l, r, sc);
+            let (el, er) = match mode {
+                ProcessingMode::ZeroLatency => self.eq.process_sample(l, r, sc),
+                ProcessingMode::NaturalPhase => {
+                    let x = self.up.process(l, r);
+                    let s = self.up_sc.process(sc.0, sc.1);
+                    let a = self.eq.process_sample(x[0].0, x[0].1, s[0]);
+                    let b = self.eq.process_sample(x[1].0, x[1].1, s[1]);
+                    self.down.process(a, b)
+                }
+                ProcessingMode::LinearPhase => self.conv.process_sample(l, r),
+            };
             ag = self.auto_gain.process((l, r), (el, er), auto_on);
             let (l, r) = (el * ag * gl, er * ag * gr);
             peak_l = peak_l.max(l.abs());
