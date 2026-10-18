@@ -4,6 +4,8 @@
 
 use nih_plug::prelude::Enum;
 use std::f64::consts::PI;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 pub const NUM_BANDS: usize = 24;
 /// 96 dB/oct needs 16 poles = 8 second-order sections.
@@ -14,6 +16,23 @@ pub const MAX_FREQ: f64 = 30_000.0;
 pub const MIN_Q: f64 = 0.025;
 pub const MAX_Q: f64 = 40.0;
 pub const MAX_GAIN_DB: f64 = 30.0;
+
+/// Width (dB) over which the dynamic gain fades in above the threshold.
+const DYN_KNEE_DB: f64 = 6.0;
+/// Dynamic gain coefficients are refreshed every this many samples.
+const DYN_UPDATE_MASK: u32 = 3;
+
+/// Live dynamic gain offsets (dB), written by the audio thread for the GUI.
+pub struct DynMeters(pub [AtomicU32; NUM_BANDS]);
+
+impl DynMeters {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self(std::array::from_fn(|_| AtomicU32::new(0f32.to_bits()))))
+    }
+    pub fn get(&self, band: usize) -> f64 {
+        f32::from_bits(self.0[band].load(Ordering::Relaxed)) as f64
+    }
+}
 
 /// Smoothing time constant for per-sample parameter smoothing.
 const SMOOTH_MS: f64 = 15.0;
@@ -108,6 +127,23 @@ pub struct BandSettings {
     pub q: f64,
     pub slope: Slope,
     pub placement: Placement,
+    pub dynamic: bool,
+    pub threshold_db: f64,
+    /// How far the gain moves (dB) when the detector is well above threshold.
+    pub range_db: f64,
+    pub attack_ms: f64,
+    pub release_ms: f64,
+    pub sidechain: bool,
+}
+
+impl FilterKind {
+    /// Whether the gain parameter has any effect for this filter type.
+    pub fn uses_gain(self) -> bool {
+        matches!(
+            self,
+            FilterKind::Bell | FilterKind::LowShelf | FilterKind::HighShelf | FilterKind::TiltShelf
+        )
+    }
 }
 
 impl Default for BandSettings {
@@ -120,6 +156,12 @@ impl Default for BandSettings {
             q: 0.707,
             slope: Slope::Db12,
             placement: Placement::Stereo,
+            dynamic: false,
+            threshold_db: -30.0,
+            range_db: -6.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            sidechain: false,
         }
     }
 }
@@ -388,6 +430,13 @@ struct Band {
     settled: bool,
     mix: f64,
     state: [ChainState; 2],
+    detect: Design,
+    detect_state: ChainState,
+    env: f64,
+    dyn_db: f64,
+    att: f64,
+    rel: f64,
+    tick: u32,
 }
 
 impl Band {
@@ -402,7 +451,20 @@ impl Band {
             settled: false,
             mix: 0.0,
             state: [[[0.0; 2]; MAX_SECTIONS]; 2],
+            detect: Design::EMPTY,
+            detect_state: [[0.0; 2]; MAX_SECTIONS],
+            env: 0.0,
+            dyn_db: 0.0,
+            att: 0.0,
+            rel: 0.0,
+            tick: 0,
         }
+    }
+
+    fn reset_state(&mut self) {
+        self.state = [[[0.0; 2]; MAX_SECTIONS]; 2];
+        self.detect_state = [[0.0; 2]; MAX_SECTIONS];
+        self.env = 0.0;
     }
 
     fn active(&self) -> bool {
@@ -415,8 +477,10 @@ impl Band {
             || t.slope != self.target.slope
             || t.placement != self.target.placement;
         if t.placement != self.target.placement || !was_active {
-            self.state = [[[0.0; 2]; MAX_SECTIONS]; 2];
+            self.reset_state();
         }
+        self.att = 1.0 - (-1.0 / (t.attack_ms.max(0.01) * 0.001 * sr)).exp();
+        self.rel = 1.0 - (-1.0 / (t.release_ms.max(0.01) * 0.001 * sr)).exp();
         if !was_active && t.enabled {
             // Snap so the band fades in at its final settings.
             self.ln_freq = t.freq.ln();
@@ -436,8 +500,21 @@ impl Band {
         }
     }
 
-    fn recompute(&mut self, sr: f64) {
+    fn recompute_main(&mut self, sr: f64) {
         self.design = design(
+            self.target.kind,
+            self.ln_freq.exp(),
+            self.gain_db + self.dyn_db,
+            self.ln_q.exp(),
+            self.target.slope,
+            sr,
+        );
+    }
+
+    fn recompute(&mut self, sr: f64) {
+        self.recompute_main(sr);
+        // Detection uses the band's own filter shape at its static gain.
+        self.detect = design(
             self.target.kind,
             self.ln_freq.exp(),
             self.gain_db,
@@ -454,6 +531,14 @@ impl Band {
             self.mix = (self.mix + mix_step).min(goal);
         } else if self.mix > goal {
             self.mix = (self.mix - mix_step).max(goal);
+        }
+        if !self.target.dynamic && self.dyn_db != 0.0 {
+            // Dynamics switched off: glide back to the static gain.
+            self.dyn_db *= 1.0 - smooth;
+            if self.dyn_db.abs() < 1e-4 {
+                self.dyn_db = 0.0;
+            }
+            self.recompute_main(sr);
         }
         if self.settled {
             return;
@@ -476,7 +561,27 @@ impl Band {
     }
 
     #[inline]
-    fn process(&mut self, l: f64, r: f64) -> (f64, f64) {
+    fn process(&mut self, l: f64, r: f64, sc: (f64, f64), sr: f64) -> (f64, f64) {
+        if self.target.dynamic && self.target.kind.uses_gain() {
+            let (a, b) = if self.target.sidechain { sc } else { (l, r) };
+            let x = match self.target.placement {
+                Placement::Left => a,
+                Placement::Right => b,
+                Placement::Side => (a - b) * 0.5,
+                Placement::Stereo | Placement::Mid => (a + b) * 0.5,
+            };
+            let level = run_chain(&self.detect, &mut self.detect_state, x).abs();
+            let c = if level > self.env { self.att } else { self.rel };
+            self.env += (level - self.env) * c;
+            let env_db = 20.0 * self.env.max(1e-6).log10();
+            let t = ((env_db - self.target.threshold_db) / DYN_KNEE_DB).clamp(0.0, 1.0);
+            let t = t * t * (3.0 - 2.0 * t);
+            self.dyn_db = self.target.range_db.clamp(-MAX_GAIN_DB, MAX_GAIN_DB) * t;
+            self.tick = self.tick.wrapping_add(1);
+            if self.tick & DYN_UPDATE_MASK == 0 {
+                self.recompute_main(sr);
+            }
+        }
         let d = &self.design;
         let [sa, sb] = &mut self.state;
         let (wl, wr) = match self.target.placement {
@@ -503,16 +608,22 @@ pub struct ParametricEq {
     sr: f64,
     smooth: f64,
     mix_step: f64,
+    meters: Arc<DynMeters>,
 }
 
 impl ParametricEq {
     /// Allocates; call from `initialize`, not from the audio thread.
     pub fn new() -> Self {
+        Self::with_meters(DynMeters::new())
+    }
+
+    pub fn with_meters(meters: Arc<DynMeters>) -> Self {
         let mut eq = Self {
             bands: (0..NUM_BANDS).map(|_| Band::new()).collect(),
             sr: 44100.0,
             smooth: 0.0,
             mix_step: 0.0,
+            meters,
         };
         eq.set_sample_rate(44100.0);
         eq
@@ -530,7 +641,7 @@ impl ParametricEq {
 
     pub fn reset(&mut self) {
         for b in &mut self.bands {
-            b.state = [[[0.0; 2]; MAX_SECTIONS]; 2];
+            b.reset_state();
         }
     }
 
@@ -542,15 +653,19 @@ impl ParametricEq {
     }
 
     #[inline]
-    pub fn process_sample(&mut self, l: f32, r: f32) -> (f32, f32) {
+    pub fn process_sample(&mut self, l: f32, r: f32, sc: (f32, f32)) -> (f32, f32) {
         let (mut l, mut r) = (l as f64, r as f64);
+        let sc = (sc.0 as f64, sc.1 as f64);
         let (sr, smooth, step) = (self.sr, self.smooth, self.mix_step);
-        for b in self.bands.iter_mut() {
+        for (i, b) in self.bands.iter_mut().enumerate() {
             if !b.active() {
                 continue;
             }
             b.advance(sr, smooth, step);
-            (l, r) = b.process(l, r);
+            (l, r) = b.process(l, r, sc, sr);
+            if b.target.dynamic || b.dyn_db != 0.0 {
+                self.meters.0[i].store((b.dyn_db as f32).to_bits(), Ordering::Relaxed);
+            }
         }
         (l as f32, r as f32)
     }
@@ -559,5 +674,48 @@ impl ParametricEq {
 impl Default for ParametricEq {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(amp: f32, sidechain_amp: Option<f32>) -> f64 {
+        let sr = 48000.0;
+        let meters = DynMeters::new();
+        let mut eq = ParametricEq::with_meters(meters.clone());
+        eq.set_sample_rate(sr);
+        let mut b = [BandSettings::default(); NUM_BANDS];
+        b[0] = BandSettings {
+            enabled: true,
+            freq: 1000.0,
+            gain_db: 0.0,
+            q: 1.0,
+            dynamic: true,
+            threshold_db: -30.0,
+            range_db: -12.0,
+            attack_ms: 5.0,
+            release_ms: 50.0,
+            sidechain: sidechain_amp.is_some(),
+            ..Default::default()
+        };
+        // A static +12 dB bell shape makes the detector sensitive at 1 kHz.
+        b[0].gain_db = 12.0;
+        eq.set_bands(&b);
+        for n in 0..48000 {
+            let ph = (std::f64::consts::TAU * 1000.0 * n as f64 / sr).sin() as f32;
+            let sc = sidechain_amp.map_or(0.0, |a| a * ph);
+            eq.process_sample(amp * ph, amp * ph, (sc, sc));
+        }
+        meters.get(0)
+    }
+
+    #[test]
+    fn dynamic_gain_follows_level() {
+        assert!(run(0.5, None) < -11.0, "loud should reach range");
+        assert!(run(0.0005, None).abs() < 0.5, "quiet should stay put");
+        assert!(run(0.0005, Some(0.5)) < -11.0, "sidechain should drive it");
+        assert!(run(0.5, Some(0.0005)).abs() < 0.5, "main input ignored with sidechain");
     }
 }

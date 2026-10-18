@@ -36,11 +36,13 @@ pub struct GuiState {
     analyzer: Analyzer,
     mode: SpectrumMode,
     resolution: Resolution,
+    meters: Arc<eq::DynMeters>,
 }
 
 impl GuiState {
-    pub fn new(tap: Arc<SpectrumTap>) -> Self {
+    pub fn new(tap: Arc<SpectrumTap>, meters: Arc<eq::DynMeters>) -> Self {
         Self {
+            meters,
             selected: None,
             analyzer: Analyzer::new(tap),
             mode: SpectrumMode::Both,
@@ -125,6 +127,9 @@ pub fn draw(
                 draw_spectrum(ui, state, plot);
             }
             let bg = ui.interact(plot.rect, Id::new("graph_bg"), Sense::click_and_drag());
+            if bands.iter().any(|b| b.enabled && b.dynamic) {
+                ui.ctx().request_repaint();
+            }
             draw_curves_and_nodes(ui, setter, state, params, &bands, plot, sample_rate);
 
             if bg.clicked() {
@@ -249,6 +254,15 @@ fn draw_spectrum(ui: &mut Ui, state: &GuiState, plot: Plot) {
     }
 }
 
+/// Band settings with the current dynamic gain offset applied.
+fn live_settings(b: &BandSettings, offset: f64) -> BandSettings {
+    let mut l = *b;
+    if l.dynamic && l.kind.uses_gain() {
+        l.gain_db = (l.gain_db + offset).clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
+    }
+    l
+}
+
 fn view_for(p: Placement) -> ResponseView {
     match p {
         Placement::Right => ResponseView::Right,
@@ -282,6 +296,8 @@ fn draw_curves_and_nodes(
             continue;
         }
         any = true;
+        let live = live_settings(b, state.meters.get(i));
+        let b = &live;
         let color = band_color(i);
         let emphasis = ui.ctx().animate_bool_with_time(
             Id::new(("emph", i)),
@@ -405,6 +421,16 @@ fn node(
 
     let color = band_color(i);
     let painter = ui.painter();
+    if b.enabled && b.dynamic && uses_gain(b.kind) {
+        // Translucent dynamic range, plus a marker at the live gain.
+        let y0 = plot.y_of(b.gain_db);
+        let y1 = plot.y_of((b.gain_db + b.range_db).clamp(-MAX_GAIN_DB, MAX_GAIN_DB));
+        let band = Rect::from_x_y_ranges(center.x - 8.0..=center.x + 8.0, y0.min(y1)..=y0.max(y1));
+        painter.rect_filled(band, 8.0, with_alpha(color, 55));
+        painter.rect_stroke(band, 8.0, Stroke::new(1.0, with_alpha(color, 110)), egui::StrokeKind::Inside);
+        let live_y = plot.y_of(live_settings(&b, state.meters.get(i)).gain_db);
+        painter.circle_filled(pos2(center.x, live_y), 3.5, Color32::WHITE);
+    }
     let r = 6.0 + 2.5 * anim + if selected { 1.0 } else { 0.0 };
     if anim > 0.01 || selected {
         painter.circle_filled(center, r + 6.0 * anim.max(0.4), with_alpha(color, (40.0 + 40.0 * anim) as u8));
@@ -590,6 +616,7 @@ fn draw_band_panel(
         .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -(BAR_HEIGHT + 12.0)))
         .show(ctx, |ui| {
             frame.show(ui, |ui| {
+                ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     labeled_knob(ui, setter, &bp.freq, "FREQ", color);
@@ -622,6 +649,35 @@ fn draw_band_panel(
                             delete_band(setter, state, bp, i);
                         }
                     });
+                });
+                ui.separator();
+                ui.add_enabled_ui(uses_gain(bp.kind.value()), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        let dynamic = bp.dynamic.value();
+                        let btn = egui::Button::new(
+                            egui::RichText::new(if dynamic { "Dynamic: On" } else { "Dynamic: Off" }).strong(),
+                        )
+                        .fill(if dynamic { with_alpha(color, 90) } else { Color32::from_gray(50) })
+                        .min_size(vec2(96.0, 26.0));
+                        if ui.add(btn).clicked() {
+                            set(setter, &bp.dynamic, !dynamic);
+                        }
+                        if dynamic {
+                            labeled_knob(ui, setter, &bp.dyn_threshold, "THRESH", color);
+                            labeled_knob(ui, setter, &bp.dyn_range, "RANGE", color);
+                            labeled_knob(ui, setter, &bp.dyn_attack, "ATTACK", color);
+                            labeled_knob(ui, setter, &bp.dyn_release, "RELEASE", color);
+                            let sc = bp.dyn_sidechain.value();
+                            let btn = egui::Button::new(if sc { "Sidechain: Ext" } else { "Sidechain: Int" })
+                                .fill(if sc { with_alpha(color, 90) } else { Color32::from_gray(50) })
+                                .min_size(vec2(104.0, 26.0));
+                            if ui.add(btn).clicked() {
+                                set(setter, &bp.dyn_sidechain, !sc);
+                            }
+                        }
+                    });
+                });
                 });
             });
         });

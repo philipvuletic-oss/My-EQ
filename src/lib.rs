@@ -16,6 +16,7 @@ pub struct MyEq {
     eq: ParametricEq,
     sample_rate: Arc<AtomicF32>,
     tap: Arc<analyzer::SpectrumTap>,
+    meters: Arc<eq::DynMeters>,
 }
 
 #[derive(Params)]
@@ -32,6 +33,18 @@ pub(crate) struct BandParams {
     q: FloatParam,
     #[id = "slope"]
     slope: EnumParam<Slope>,
+    #[id = "dyn"]
+    dynamic: BoolParam,
+    #[id = "dthr"]
+    dyn_threshold: FloatParam,
+    #[id = "drng"]
+    dyn_range: FloatParam,
+    #[id = "datk"]
+    dyn_attack: FloatParam,
+    #[id = "drel"]
+    dyn_release: FloatParam,
+    #[id = "dsc"]
+    dyn_sidechain: BoolParam,
     #[id = "place"]
     placement: EnumParam<Placement>,
 }
@@ -82,6 +95,39 @@ impl BandParams {
             )
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
             slope: EnumParam::new("Slope", Slope::Db12),
+            dynamic: BoolParam::new("Dynamic", false),
+            dyn_threshold: FloatParam::new(
+                "Threshold",
+                -30.0,
+                FloatRange::Linear { min: -60.0, max: 0.0 },
+            )
+            .with_unit(" dB")
+            .with_step_size(0.1),
+            dyn_range: FloatParam::new(
+                "Range",
+                -6.0,
+                FloatRange::Linear {
+                    min: -(MAX_GAIN_DB as f32),
+                    max: MAX_GAIN_DB as f32,
+                },
+            )
+            .with_unit(" dB")
+            .with_step_size(0.1),
+            dyn_attack: FloatParam::new(
+                "Attack",
+                10.0,
+                FloatRange::Skewed { min: 0.1, max: 500.0, factor: log_skew(0.1, 500.0) },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            dyn_release: FloatParam::new(
+                "Release",
+                100.0,
+                FloatRange::Skewed { min: 5.0, max: 5000.0, factor: log_skew(5.0, 5000.0) },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
+            dyn_sidechain: BoolParam::new("Sidechain", false),
             placement: EnumParam::new("Placement", Placement::Stereo),
         }
     }
@@ -95,6 +141,12 @@ impl BandParams {
             q: self.q.value() as f64,
             slope: self.slope.value(),
             placement: self.placement.value(),
+            dynamic: self.dynamic.value(),
+            threshold_db: self.dyn_threshold.value() as f64,
+            range_db: self.dyn_range.value() as f64,
+            attack_ms: self.dyn_attack.value() as f64,
+            release_ms: self.dyn_release.value() as f64,
+            sidechain: self.dyn_sidechain.value(),
         }
     }
 }
@@ -125,9 +177,11 @@ impl MyEqParams {
 
 impl Default for MyEq {
     fn default() -> Self {
+        let meters = eq::DynMeters::new();
         Self {
             params: Arc::new(MyEqParams::default()),
-            eq: ParametricEq::new(),
+            eq: ParametricEq::with_meters(meters.clone()),
+            meters,
             sample_rate: Arc::new(AtomicF32::new(44100.0)),
             tap: analyzer::SpectrumTap::new(),
         }
@@ -173,6 +227,11 @@ impl Plugin for MyEq {
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: NonZeroU32::new(2),
         main_output_channels: NonZeroU32::new(2),
+        aux_input_ports: &[new_nonzero_u32(2)],
+        names: PortNames {
+            aux_inputs: &["Sidechain"],
+            ..PortNames::const_default()
+        },
         ..AudioIOLayout::const_default()
     }];
 
@@ -191,9 +250,10 @@ impl Plugin for MyEq {
         let egui_state = self.params.editor_state.clone();
         let sample_rate = self.sample_rate.clone();
         let tap = self.tap.clone();
+        let meters = self.meters.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            gui::GuiState::new(tap),
+            gui::GuiState::new(tap, meters),
             |_, _| {},
             move |egui_ctx, setter, state| {
                 gui::draw(
@@ -226,13 +286,25 @@ impl Plugin for MyEq {
     fn process(
         &mut self,
         buffer: &mut Buffer,
-        _aux: &mut AuxiliaryBuffers,
+        aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let settings: [BandSettings; NUM_BANDS] = self.params.band_settings();
         self.eq.set_bands(&settings);
 
-        for mut channel_samples in buffer.iter_samples() {
+        let sidechain: &[&mut [f32]] = match aux.inputs.first_mut() {
+            Some(b) if b.channels() >= 2 => b.as_slice_immutable(),
+            _ => &[],
+        };
+
+        for (idx, mut channel_samples) in buffer.iter_samples().enumerate() {
+            let sc = match sidechain {
+                [l, r, ..] => (
+                    l.get(idx).copied().unwrap_or(0.0),
+                    r.get(idx).copied().unwrap_or(0.0),
+                ),
+                _ => (0.0, 0.0),
+            };
             let gain = self.params.output_gain.smoothed.next();
             let pan = self.params.output_pan.smoothed.next();
             // Constant-power pan law, unity gain at centre.
@@ -244,7 +316,7 @@ impl Plugin for MyEq {
             let l = *channel_samples.get_mut(0).unwrap();
             let r = *channel_samples.get_mut(1).unwrap();
             self.tap.pre.push((l + r) * 0.5);
-            let (l, r) = self.eq.process_sample(l, r);
+            let (l, r) = self.eq.process_sample(l, r, sc);
             let (l, r) = (l * gl, r * gr);
             self.tap.post.push((l + r) * 0.5);
             *channel_samples.get_mut(0).unwrap() = l;
