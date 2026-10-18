@@ -1,5 +1,6 @@
 //! egui editor: full-window response graph with draggable band nodes.
 
+use crate::analyzer::{Analyzer, Resolution, SpectrumMode, SpectrumTap, COLUMNS, column_freq, FLOOR_DB};
 use crate::eq::{
     self, BandSettings, FilterKind, Placement, ResponseView, Slope, MAX_FREQ, MAX_GAIN_DB, MAX_Q,
     MIN_FREQ, MIN_Q, NUM_BANDS,
@@ -30,9 +31,22 @@ const FREQ_LABELS: [(f64, &str); 10] = [
     (20000.0, "20k"),
 ];
 
-#[derive(Default)]
 pub struct GuiState {
     selected: Option<usize>,
+    analyzer: Analyzer,
+    mode: SpectrumMode,
+    resolution: Resolution,
+}
+
+impl GuiState {
+    pub fn new(tap: Arc<SpectrumTap>) -> Self {
+        Self {
+            selected: None,
+            analyzer: Analyzer::new(tap),
+            mode: SpectrumMode::Both,
+            resolution: Resolution::Medium,
+        }
+    }
 }
 
 pub fn band_color(index: usize) -> Color32 {
@@ -104,6 +118,12 @@ pub fn draw(
             let bands = params.band_settings();
 
             draw_background(ui, full, plot);
+            state.analyzer.set_resolution(state.resolution);
+            state.analyzer.update(state.mode, sample_rate);
+            if state.mode != SpectrumMode::Off {
+                ui.ctx().request_repaint();
+                draw_spectrum(ui, state, plot);
+            }
             let bg = ui.interact(plot.rect, Id::new("graph_bg"), Sense::click_and_drag());
             draw_curves_and_nodes(ui, setter, state, params, &bands, plot, sample_rate);
 
@@ -116,7 +136,7 @@ pub fn draw(
                 }
             }
 
-            draw_bottom_bar(ui, setter, params, full);
+            draw_bottom_bar(ui, setter, state, params, full);
             if let Some(sel) = state.selected {
                 draw_band_panel(ctx, setter, state, params, sel, full);
             }
@@ -183,6 +203,49 @@ fn draw_background(ui: &Ui, full: Rect, plot: Plot) {
             font.clone(),
             label_col,
         );
+    }
+}
+
+const SPEC_DB_LO: f32 = -96.0;
+const SPEC_DB_HI: f32 = 6.0;
+
+fn draw_spectrum(ui: &mut Ui, state: &GuiState, plot: Plot) {
+    let painter = ui.painter_at(plot.rect);
+    let (top, bottom) = (plot.rect.top() + PAD_Y, plot.rect.bottom());
+    let y_of = |db: f32| {
+        let t = ((db - SPEC_DB_LO) / (SPEC_DB_HI - SPEC_DB_LO)).clamp(0.0, 1.0);
+        bottom - t * (bottom - top)
+    };
+    let pts = |v: &[f32]| -> Vec<Pos2> {
+        (0..COLUMNS)
+            .map(|c| pos2(plot.x_of(column_freq(c as f32 + 0.5)), y_of(v[c])))
+            .collect()
+    };
+    let a = &state.analyzer;
+    if state.mode.post() {
+        let p = pts(&a.post.smooth);
+        let uv = egui::epaint::WHITE_UV;
+        let mut mesh = Mesh::default();
+        let (c_top, c_bot) = (Color32::from_rgba_unmultiplied(110, 135, 175, 90), Color32::from_rgba_unmultiplied(110, 135, 175, 8));
+        for (k, pt) in p.iter().enumerate() {
+            mesh.vertices.push(Vertex { pos: *pt, uv, color: c_top });
+            mesh.vertices.push(Vertex { pos: pos2(pt.x, bottom), uv, color: c_bot });
+            if k > 0 {
+                let i = (k * 2) as u32;
+                mesh.indices.extend_from_slice(&[i - 2, i - 1, i, i - 1, i + 1, i]);
+            }
+        }
+        painter.add(Shape::mesh(mesh));
+        painter.add(Shape::line(p, Stroke::new(1.0, Color32::from_rgba_unmultiplied(150, 175, 215, 140))));
+    }
+    if state.mode.pre() {
+        painter.add(Shape::line(pts(&a.pre.smooth), Stroke::new(1.0, Color32::from_white_alpha(45))));
+    }
+    // Peak hold follows the primary (post if shown, otherwise pre) trace.
+    let peak = if state.mode.post() { &a.post.peak } else { &a.pre.peak };
+    let visible: Vec<Pos2> = pts(peak);
+    if peak.iter().any(|&v| v > FLOOR_DB + 1.0) {
+        painter.add(Shape::line(visible, Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 215, 240, 90))));
     }
 }
 
@@ -564,7 +627,7 @@ fn draw_band_panel(
         });
 }
 
-fn draw_bottom_bar(ui: &mut Ui, setter: &ParamSetter, params: &MyEqParams, full: Rect) {
+fn draw_bottom_bar(ui: &mut Ui, setter: &ParamSetter, state: &mut GuiState, params: &MyEqParams, full: Rect) {
     let bar = Rect::from_min_max(pos2(full.left(), full.bottom() - BAR_HEIGHT), full.max);
     let painter = ui.painter();
     painter.rect_filled(bar, 0.0, Color32::from_rgb(0x12, 0x14, 0x19));
@@ -585,6 +648,28 @@ fn draw_bottom_bar(ui: &mut Ui, setter: &ParamSetter, params: &MyEqParams, full:
     bar_ui.label(egui::RichText::new("PAN").size(11.0).color(dim));
     knob(&mut bar_ui, setter, &params.output_pan, 30.0, accent);
     bar_ui.label(egui::RichText::new(value_text(&params.output_pan)).size(11.0));
+
+    // Right-aligned analyzer controls.
+    bar_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        for (r, name) in [(Resolution::High, "High"), (Resolution::Medium, "Med"), (Resolution::Low, "Low")] {
+            if ui.selectable_label(state.resolution == r, name).clicked() {
+                state.resolution = r;
+            }
+        }
+        ui.label(egui::RichText::new("RES").size(11.0).color(dim));
+        ui.add_space(16.0);
+        for (m, name) in [
+            (SpectrumMode::Both, "Pre+Post"),
+            (SpectrumMode::Post, "Post"),
+            (SpectrumMode::Pre, "Pre"),
+            (SpectrumMode::Off, "Off"),
+        ] {
+            if ui.selectable_label(state.mode == m, name).clicked() {
+                state.mode = m;
+            }
+        }
+        ui.label(egui::RichText::new("ANALYZER").size(11.0).color(dim));
+    });
 }
 
 pub fn sample_rate_of(sr: &nih_plug::prelude::AtomicF32) -> f64 {

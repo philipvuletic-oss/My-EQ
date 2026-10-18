@@ -2,6 +2,7 @@ use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
 use std::sync::Arc;
 
+mod analyzer;
 mod eq;
 mod gui;
 
@@ -14,6 +15,7 @@ pub struct MyEq {
     params: Arc<MyEqParams>,
     eq: ParametricEq,
     sample_rate: Arc<AtomicF32>,
+    tap: Arc<analyzer::SpectrumTap>,
 }
 
 #[derive(Params)]
@@ -127,6 +129,7 @@ impl Default for MyEq {
             params: Arc::new(MyEqParams::default()),
             eq: ParametricEq::new(),
             sample_rate: Arc::new(AtomicF32::new(44100.0)),
+            tap: analyzer::SpectrumTap::new(),
         }
     }
 }
@@ -187,9 +190,10 @@ impl Plugin for MyEq {
         let params = self.params.clone();
         let egui_state = self.params.editor_state.clone();
         let sample_rate = self.sample_rate.clone();
+        let tap = self.tap.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            gui::GuiState::default(),
+            gui::GuiState::new(tap),
             |_, _| {},
             move |egui_ctx, setter, state| {
                 gui::draw(
@@ -239,9 +243,12 @@ impl Plugin for MyEq {
             );
             let l = *channel_samples.get_mut(0).unwrap();
             let r = *channel_samples.get_mut(1).unwrap();
+            self.tap.pre.push((l + r) * 0.5);
             let (l, r) = self.eq.process_sample(l, r);
-            *channel_samples.get_mut(0).unwrap() = l * gl;
-            *channel_samples.get_mut(1).unwrap() = r * gr;
+            let (l, r) = (l * gl, r * gr);
+            self.tap.post.push((l + r) * 0.5);
+            *channel_samples.get_mut(0).unwrap() = l;
+            *channel_samples.get_mut(1).unwrap() = r;
         }
         ProcessStatus::Normal
     }
