@@ -1,8 +1,9 @@
 use nih_plug::prelude::*;
-use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
+use nih_plug_egui::{create_egui_editor, EguiState};
 use std::sync::Arc;
 
 mod eq;
+mod gui;
 
 use eq::{
     BandSettings, FilterKind, ParametricEq, Placement, Slope, MAX_FREQ, MAX_GAIN_DB, MAX_Q,
@@ -12,11 +13,11 @@ use eq::{
 pub struct MyEq {
     params: Arc<MyEqParams>,
     eq: ParametricEq,
-    sample_rate: f32,
+    sample_rate: Arc<AtomicF32>,
 }
 
 #[derive(Params)]
-struct BandParams {
+pub(crate) struct BandParams {
     #[id = "on"]
     enabled: BoolParam,
     #[id = "type"]
@@ -97,7 +98,7 @@ impl BandParams {
 }
 
 #[derive(Params)]
-struct MyEqParams {
+pub(crate) struct MyEqParams {
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
 
@@ -115,7 +116,7 @@ impl MyEqParams {
     /// Snapshot of all band settings, e.g. for the GUI response curve via
     /// `eq::magnitude_response`.
     #[allow(dead_code)]
-    fn band_settings(&self) -> [BandSettings; NUM_BANDS] {
+    pub(crate) fn band_settings(&self) -> [BandSettings; NUM_BANDS] {
         std::array::from_fn(|i| self.bands[i].settings())
     }
 }
@@ -125,7 +126,7 @@ impl Default for MyEq {
         Self {
             params: Arc::new(MyEqParams::default()),
             eq: ParametricEq::new(),
-            sample_rate: 44100.0,
+            sample_rate: Arc::new(AtomicF32::new(44100.0)),
         }
     }
 }
@@ -133,7 +134,7 @@ impl Default for MyEq {
 impl Default for MyEqParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(300, 200),
+            editor_state: EguiState::from_size(1000, 560),
             bands: std::array::from_fn(BandParams::new),
             output_gain: FloatParam::new(
                 "Output Gain",
@@ -184,18 +185,21 @@ impl Plugin for MyEq {
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
+        let egui_state = self.params.editor_state.clone();
+        let sample_rate = self.sample_rate.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            gui::GuiState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    ui.heading("My EQ");
-                    ui.label("Output Gain");
-                    ui.add(widgets::ParamSlider::for_param(&params.output_gain, setter));
-                    ui.label("Output Pan");
-                    ui.add(widgets::ParamSlider::for_param(&params.output_pan, setter));
-                });
+            move |egui_ctx, setter, state| {
+                gui::draw(
+                    egui_ctx,
+                    setter,
+                    state,
+                    &params,
+                    &egui_state,
+                    gui::sample_rate_of(&sample_rate),
+                );
             },
         )
     }
@@ -206,7 +210,7 @@ impl Plugin for MyEq {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.sample_rate = buffer_config.sample_rate;
+        self.sample_rate.store(buffer_config.sample_rate, std::sync::atomic::Ordering::Relaxed);
         self.eq.set_sample_rate(buffer_config.sample_rate as f64);
         true
     }
